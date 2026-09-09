@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f1f5f9;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: #0f172a;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Reusable card style */
+.card {
+  @apply bg-white rounded-2xl shadow-sm border border-slate-200 p-5;
+}
+
+.card-title {
+  @apply text-sm font-medium text-slate-500;
+}
+
+/* Subtle pulse for the "live" dot */
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.live-dot {
+  animation: livePulse 1.6s ease-in-out infinite;
+}

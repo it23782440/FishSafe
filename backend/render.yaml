@@ -1,0 +1,25 @@
+# Render Blueprint for the FishSafe backend.
+# You can either use this file (New + -> Blueprint -> point at the repo) or
+# configure the same values manually in the Render dashboard.
+services:
+  - type: web
+    name: fishsafe-backend
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DEVICE_OFFLINE_SECONDS
+        value: "180"
+      # Secrets: set these in the Render dashboard (do NOT hard-code here).
+      - key: MONGODB_URI
+        sync: false
+      - key: DEVICE_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
