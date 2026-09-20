@@ -2,8 +2,9 @@
  * Central API helper. All dashboard data goes through here so the backend URL
  * and field names are defined in exactly one place.
  */
-export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:5000';
+export const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE_URL || 'https://fishsafebackend-production.up.railway.app'
+).replace(/\/$/, '');
 
 export const DEVICE_ID =
   process.env.NEXT_PUBLIC_DEVICE_ID || 'FISHSAFE-001';
