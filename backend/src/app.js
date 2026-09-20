@@ -11,31 +11,32 @@ const app = express();
 // --- Security headers ---
 app.use(helmet());
 
-// --- CORS: default allowed origins for local dev and production Vercel ---
-const defaultOrigins = [
-  'http://localhost:3000',
-  'https://fish-safe-frontend.vercel.app'
-];
-
-const origins = process.env.CORS_ORIGINS
-  ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
-  : defaultOrigins;
-
+// --- CORS: allow localhost and all *.vercel.app deployment URLs ---
 app.use(
   cors({
-    origin: origins.includes('*') ? true : origins,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+
+      // Allow any local origin or any sub-domain under vercel.app
+      if (origin.includes('localhost') || origin.endsWith('.vercel.app')) {
+        return callback(null, true);
+      }
+
+      return callback(new Error('Not allowed by CORS'));
+    },
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'x-api-key'],
   })
 );
 
-// --- Body parsing (small limit; device payloads are tiny) ---
+// --- Body parsing ---
 app.use(express.json({ limit: '16kb' }));
 
-// --- Rate limiting (basic abuse protection) ---
+// --- Rate limiting ---
 const limiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 120, // 120 req/min/IP is plenty for one device + a dashboard
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -47,7 +48,7 @@ app.get('/', (req, res) =>
 );
 app.use('/api', apiRoutes);
 
-// --- 404 + error handling (must be last) ---
+// --- 404 + error handling ---
 app.use(notFound);
 app.use(errorHandler);
 
