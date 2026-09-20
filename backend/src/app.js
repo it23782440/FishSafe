@@ -15,18 +15,19 @@ app.use(helmet());
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      // Allow requests with no origin (e.g. mobile apps, curl, Postman, server-to-server)
       if (!origin) return callback(null, true);
 
-      // Allow any local origin or any sub-domain under vercel.app
+      // Allow local development and any subdomain under vercel.app
       if (origin.includes('localhost') || origin.endsWith('.vercel.app')) {
         return callback(null, true);
       }
 
       return callback(new Error('Not allowed by CORS'));
     },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'x-api-key'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+    credentials: true,
   })
 );
 
