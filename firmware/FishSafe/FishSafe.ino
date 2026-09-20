@@ -45,8 +45,8 @@ const char* DEVICE_ID  = "FISHSAFE-001";     // Must match a device in the backe
 // If your backend is HTTPS-only on Render, either enable the SSL client
 // (see notes in hardware/README) or place an HTTP proxy in front. For an
 // academic prototype, HTTP on port 80 to the Render host is the simplest path.
-const char* API_HOST   = "your-backend.onrender.com"; // <-- CHANGE ME
-const int   API_PORT   = 80;                           // 80 = HTTP, 443 = HTTPS
+const char* API_HOST   = "https://fishsafebackend-production.up.railway.app"; // <-- CHANGE ME
+const int   API_PORT   = 443;                           // 80 = HTTP, 443 = HTTPS
 const char* API_PATH   = "/api/sensors/data";          // POST endpoint
 const char* API_KEY    = "CHANGE_ME_SUPER_SECRET_KEY"; // Must equal DEVICE_API_KEY on backend
 
@@ -57,7 +57,7 @@ const char* GPRS_PASS  = "";           // usually empty
 const char* SIM_PIN    = "";           // SIM PIN, or "" if disabled
 
 // ---- SMS alert recipient (farmer's phone, international format) ----
-const char* ALERT_PHONE = "+9477XXXXXXX";  // <-- CHANGE ME
+const char* ALERT_PHONE = "+94769767326";  // <-- CHANGE ME
 
 // ---- Timing ----
 const unsigned long SEND_INTERVAL_MS = 60UL * 1000UL; // send every 60 s

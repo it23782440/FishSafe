@@ -11,11 +11,15 @@ const app = express();
 // --- Security headers ---
 app.use(helmet());
 
-// --- CORS: only allow the configured Vercel origins (comma-separated) ---
-const origins = (process.env.CORS_ORIGINS || '*')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+// --- CORS: default allowed origins for local dev and production Vercel ---
+const defaultOrigins = [
+  'http://localhost:3000',
+  'https://fish-safe-frontend.vercel.app'
+];
+
+const origins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
+  : defaultOrigins;
 
 app.use(
   cors({
