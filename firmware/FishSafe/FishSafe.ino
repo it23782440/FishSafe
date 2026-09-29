@@ -1,31 +1,15 @@
 /*
  * ============================================================================
- *  FishSafe - Real-Time Water Quality Monitoring & Alert System
- *  Firmware for ESP32 + SIM800L GSM/GPRS
- * ----------------------------------------------------------------------------
- *  Sensors:   DS18B20 (temperature), pH, Turbidity, Rain, TDS/Conductivity
- *  Flow:      Sensors -> ESP32 -> SIM800L (GPRS) -> Backend API -> MongoDB
- *  Alerts:    On DANGER, an SMS is sent directly from the SIM800L to the farmer.
- *
- *  Board:     ESP32 Dev Module (Arduino core for ESP32 >= 2.0.x)
- *  Author:    FishSafe Team (NTP/26/09)
- *
- *  REQUIRED LIBRARIES (install via Arduino IDE Library Manager):
- *    - TinyGSM               by Volodymyr Shymanskyy   (>= 0.11.7)
- *    - ArduinoHttpClient     by Arduino                (>= 0.4.0)
- *    - ArduinoJson           by Benoit Blanchon        (>= 6.21.0)
- *    - OneWire               by Paul Stoffregen        (>= 2.3.7)
- *    - DallasTemperature     by Miles Burton           (>= 3.9.0)
- *
- *  >>> EVERYTHING YOU MAY NEED TO CHANGE IS IN THE "CONFIGURATION" BLOCK <<<
+ * FishSafe - ESP32 + SIM800L + Railway HTTPS Firmware
+ * Complete Sensor Telemetry & SMS Alert Code
  * ============================================================================
  */
 
-// TinyGSM must know the modem model BEFORE including the library.
 #define TINY_GSM_MODEM_SIM800
-#define TINY_GSM_RX_BUFFER 1024      // Larger RX buffer = fewer dropped bytes.
-#define SerialMon Serial             // USB serial monitor (debug)
-#define SerialAT  Serial2            // UART2 talks to the SIM800L
+#define TINY_GSM_RX_BUFFER 1024
+
+#define SerialMon Serial
+#define SerialAT  Serial2
 
 #include <TinyGsmClient.h>
 #include <ArduinoHttpClient.h>
@@ -34,129 +18,156 @@
 #include <DallasTemperature.h>
 
 // ============================================================================
-//  1) CONFIGURATION  --  edit the values in this block for your deployment
+// 1. MODEM & CLIENTS
 // ============================================================================
 
-// ---- Device identity ----
-const char* DEVICE_ID  = "FISHSAFE-001";     // Must match a device in the backend
+TinyGsm modem(SerialAT);
 
-// ---- Backend API (Render) ----
-// Use the plain host (no https://) + port. TinyGSM's SIM800L does plain HTTP.
-// If your backend is HTTPS-only on Render, either enable the SSL client
-// (see notes in hardware/README) or place an HTTP proxy in front. For an
-// academic prototype, HTTP on port 80 to the Render host is the simplest path.
-const char* API_HOST   = "https://fishsafebackend-production.up.railway.app"; // <-- CHANGE ME
-const int   API_PORT   = 443;                           // 80 = HTTP, 443 = HTTPS
-const char* API_PATH   = "/api/sensors/data";          // POST endpoint
-const char* API_KEY    = "CHANGE_ME_SUPER_SECRET_KEY"; // Must equal DEVICE_API_KEY on backend
+// SIM800L's built-in SSL only speaks TLS 1.0, and Railway requires TLS 1.2+,
+// so a direct HTTPS connection from the SIM800L to Railway always fails.
+// Leave USE_TLS = 0 and point API_HOST at a plain-HTTP relay (e.g. a
+// Cloudflare-proxied domain with "Always Use HTTPS" OFF) that forwards to Railway.
+// Only set USE_TLS = 1 with a modem that supports TLS 1.2 (SIM7600, A7670...).
+#define USE_TLS 0
 
-// ---- Cellular (GPRS) ----
-const char* APN        = "dialogbb";   // <-- CHANGE to your carrier's APN
-const char* GPRS_USER  = "";           // usually empty
-const char* GPRS_PASS  = "";           // usually empty
-const char* SIM_PIN    = "";           // SIM PIN, or "" if disabled
-
-// ---- SMS alert recipient (farmer's phone, international format) ----
-const char* ALERT_PHONE = "+94769767326";  // <-- CHANGE ME
-
-// ---- Timing ----
-const unsigned long SEND_INTERVAL_MS = 60UL * 1000UL; // send every 60 s
-const unsigned long SMS_COOLDOWN_MS  = 15UL * 60UL * 1000UL; // 15 min anti-spam
-const int  MAX_HTTP_RETRIES = 3;
-
-// ---- ADC (ESP32 12-bit, calibrated millivolt read) ----
-const int  ADC_SAMPLES = 20;           // averaged samples per analog read
-
-// ---- CALIBRATION (see PART 9 / hardware/README for procedure) ----
-// pH: two-point calibration. Measure the analog voltage (in Volts, AT THE
-//     ESP32 PIN i.e. AFTER the divider) while probe sits in pH7 then pH4 buffer.
-float PH_V7 = 1.65;   // ESP32-pin voltage in pH 7.0 buffer  <-- CALIBRATE
-float PH_V4 = 2.02;   // ESP32-pin voltage in pH 4.0 buffer  <-- CALIBRATE
-
-// Turbidity: raw sensor voltage (reconstructed to sensor side) in CLEAR water.
-float TURB_V_CLEAR = 4.10;  // sensor-side volts in clear water <-- CALIBRATE
-
-// TDS/Conductivity: probe K factor is baked into the DFRobot formula; set the
-// reference temperature used for compensation.
-float TDS_TEMP_C = 25.0;    // will be overwritten by live DS18B20 temperature
-
-// Rain: raw millivolts at the ESP32 pin for fully DRY and fully WET board.
-int   RAIN_MV_DRY = 3100;   // dry board  (high voltage) <-- CALIBRATE
-int   RAIN_MV_WET = 700;    // soaked board (low voltage) <-- CALIBRATE
-
-// Hardware voltage divider ratio for 5V-swing sensors -> 3.3V ADC.
-// Vpin = Vsensor * DIVIDER  (R1=10k top, R2=20k bottom => 0.667). pH & turbidity
-// & rain go through this divider; TDS (Gravity, 0-2.3V) is wired direct => 1.0.
-const float DIVIDER_PH   = 0.667;
-const float DIVIDER_TURB = 0.667;
-const float DIVIDER_TDS  = 1.000;
+#if USE_TLS
+TinyGsmClientSecure gsmClient(modem);
+#else
+TinyGsmClient gsmClient(modem);
+#endif
 
 // ============================================================================
-//  2) THRESHOLDS  --  keep these IDENTICAL to backend/src/config/thresholds.js
-//     Values from the FishSafe proposal where given; others are documented
-//     engineering assumptions that MUST be validated for your target species.
+// 2. RAILWAY BACKEND CONFIGURATION
 // ============================================================================
-struct Range { float warnLow, safeLow, safeHigh, warnHigh; };
-//                         v-- below = DANGER  |  safe band  |  above = DANGER --v
-Range TH_TEMP = { 23.0, 25.0, 32.0, 34.0 };   // Proposal: tilapia 25-32 C
-Range TH_PH   = { 6.0,  6.5,  8.5,  9.0  };   // Proposal: pH 6.5-8.5
-// Turbidity/Rain/TDS only have an UPPER concern (or are one-sided): we encode
-// them with a wide low side so only the high side trips.
-Range TH_TURB = { -1e9, -1e9, 25.0, 40.0 };   // ASSUMPTION: <25 NTU good
-Range TH_RAIN = { -1e9, -1e9, 50.0, 80.0 };   // ASSUMPTION: rain intensity %
-Range TH_TDS  = { 50.0, 100.0, 800.0, 1000.0 }; // ASSUMPTION: TDS ppm for tilapia
+
+// Do NOT include "https://" or trailing slashes "/"
+const char* API_HOST = "fishsafebackend-production.up.railway.app"; // replace with your HTTP relay host when USE_TLS = 0
+const int   API_PORT = USE_TLS ? 443 : 80;
+const char* API_PATH = "/api/sensors/data";
+
+// Must match your backend's DEVICE_API_KEY environment variable
+const char* API_KEY   = "YOUR_DEVICE_API_KEY_HERE";
+const char* DEVICE_ID = "FISHSAFE-001";
 
 // ============================================================================
-//  3) PIN MAP  (see hardware/pinout.md for the full wiring table)
+// 3. GSM / GPRS / SMS CONFIGURATION
 // ============================================================================
-#define PIN_DS18B20   4     // OneWire data (needs 4.7k pull-up to 3V3)
-#define PIN_PH        34    // ADC1_CH6, input-only  (via divider)
-#define PIN_TURB      35    // ADC1_CH7, input-only  (via divider)
-#define PIN_TDS       32    // ADC1_CH4              (direct, <=2.3V)
-#define PIN_RAIN      33    // ADC1_CH5              (via divider)
-#define PIN_SIM_TX    17    // ESP32 TX2 -> SIM800L RX (through level care)
-#define PIN_SIM_RX    16    // ESP32 RX2 <- SIM800L TX
-#define PIN_SIM_PWRKEY -1   // set to a GPIO if your SIM800L breakout wires PWRKEY
+
+const char* APN         = "dialogbb"; // Network APN
+const char* GPRS_USER   = "";
+const char* GPRS_PASS   = "";
+const char* SIM_PIN     = "";
+
+// SMS Alert Recipient
+const char* ALERT_PHONE = "+94769767326";
 
 // ============================================================================
-//  Globals
+// 4. TIMING & RETRIES
 // ============================================================================
-TinyGsm        modem(SerialAT);
-TinyGsmClient  gsmClient(modem);
-HttpClient     http(gsmClient, API_HOST, API_PORT);
 
-OneWire           oneWire(PIN_DS18B20);
+const unsigned long SEND_INTERVAL_MS = 60UL * 1000UL;      // Upload every 60 seconds
+const unsigned long SMS_COOLDOWN_MS  = 15UL * 60UL * 1000UL; // 15 min SMS cooldown
+const int           MAX_HTTP_RETRIES = 3;
+
+// ============================================================================
+// 5. PIN DEFINITIONS
+// ============================================================================
+
+#define PIN_DS18B20 4
+#define PIN_PH      34
+#define PIN_TURB    35
+#define PIN_TDS     32
+#define PIN_RAIN    33
+
+// SIM800L Hardware Serial Pins
+// ESP32 TX2 (GPIO17) -> SIM800L RX
+// ESP32 RX2 (GPIO16) <- SIM800L TX
+#define PIN_SIM_TX  17
+#define PIN_SIM_RX  16
+
+// ============================================================================
+// 6. SENSOR OBJECTS & VARIABLES
+// ============================================================================
+
+OneWire oneWire(PIN_DS18B20);
 DallasTemperature ds18b20(&oneWire);
 
 unsigned long lastSend = 0;
-unsigned long lastSmsAt[5] = {0,0,0,0,0};  // per-sensor SMS cooldown timestamps
-const char*   SENSOR_NAMES[5] = {"temperature","ph","turbidity","rain","conductivity"};
+unsigned long lastSmsAt[5] = {0, 0, 0, 0, 0};
 
-// Holds one full measurement cycle.
+const char* SENSOR_NAMES[5] = {
+  "temperature",
+  "ph",
+  "turbidity",
+  "rain",
+  "conductivity"
+};
+
+// Calibration Constants
+const int   ADC_SAMPLES   = 20;
+float       PH_V7         = 1.65;
+float       PH_V4         = 2.02;
+float       TURB_V_CLEAR  = 4.10;
+float       TDS_TEMP_C    = 25.0;
+int         RAIN_MV_DRY   = 3100;
+int         RAIN_MV_WET   = 700;
+
+const float DIVIDER_PH    = 0.667;
+const float DIVIDER_TURB  = 0.667;
+const float DIVIDER_TDS   = 1.000;
+
+// ============================================================================
+// 7. THRESHOLDS & STRUCTURES
+// ============================================================================
+
+struct Range {
+  float warnLow;
+  float safeLow;
+  float safeHigh;
+  float warnHigh;
+};
+
+Range TH_TEMP = {23.0, 25.0, 32.0, 34.0};
+Range TH_PH   = {6.0,  6.5,  8.5,  9.0};
+Range TH_TURB = {-1e9, -1e9, 25.0, 40.0};
+Range TH_RAIN = {-1e9, -1e9, 50.0, 80.0};
+Range TH_TDS  = {50.0, 100.0, 800.0, 1000.0};
+
 struct Reading {
-  float temperature, ph, turbidity, rain, conductivity;
-  bool  ok[5];                 // per-sensor validity
-  const char* status[5];       // per-sensor status string
-  const char* overall;         // worst-of overall status
-  int   signalPct;             // GSM signal quality %
+  float temperature;
+  float ph;
+  float turbidity;
+  float rain;
+  float conductivity;
+
+  bool ok[5];
+  const char* status[5];
+  const char* overall;
+  int signalPct;
 };
 
 // ============================================================================
-//  Helpers: analog reading
+// 8. HELPER FUNCTIONS
 // ============================================================================
-// Returns averaged, calibrated millivolts at the given ADC pin.
+
+float round2(float v) {
+  if (isnan(v)) return v;
+  return roundf(v * 100.0) / 100.0;
+}
+
 float readPinMilliVolts(int pin) {
   long sum = 0;
   for (int i = 0; i < ADC_SAMPLES; i++) {
-    sum += analogReadMilliVolts(pin);   // ESP32 core factory calibration
+    sum += analogReadMilliVolts(pin);
     delay(2);
   }
   return (float)sum / ADC_SAMPLES;
 }
 
 // ============================================================================
-//  Sensor conversions
+// 9. SENSOR READINGS
 // ============================================================================
+
 float readTemperature(bool &ok) {
   ds18b20.requestTemperatures();
   float t = ds18b20.getTempCByIndex(0);
@@ -165,26 +176,27 @@ float readTemperature(bool &ok) {
 }
 
 float readPH(bool &ok) {
-  float vPin = readPinMilliVolts(PIN_PH) / 1000.0;   // volts at pin
-  float vSensor = vPin / DIVIDER_PH;                 // reconstruct sensor volts
-  // Two-point line through (PH_V7 -> 7.0) and (PH_V4 -> 4.0). Note PH_V4/PH_V7
-  // are stored as PIN voltages, so compare against vPin directly.
-  float slope = (4.0 - 7.0) / (PH_V4 - PH_V7);       // pH per volt
+  float vPin = readPinMilliVolts(PIN_PH) / 1000.0;
+  float slope = (4.0 - 7.0) / (PH_V4 - PH_V7);
   float ph = 7.0 + (vPin - PH_V7) * slope;
   ok = (vPin > 0.05 && ph > 0.0 && ph < 14.0);
-  (void)vSensor;
   return ok ? ph : NAN;
 }
 
 float readTurbidity(bool &ok) {
   float vPin = readPinMilliVolts(PIN_TURB) / 1000.0;
-  float v = vPin / DIVIDER_TURB;                     // back to sensor 0-4.5V
-  // DFRobot SEN0189 empirical curve (valid ~2.5-4.2V). Clamp to sane NTU.
+  float v = vPin / DIVIDER_TURB;
   float ntu;
-  if (v >= TURB_V_CLEAR) ntu = 0.0;                  // clearer than reference
-  else ntu = -1120.4 * v * v + 5742.3 * v - 4353.8;
-  if (ntu < 0)    ntu = 0;
+
+  if (v >= TURB_V_CLEAR) {
+    ntu = 0.0;
+  } else {
+    ntu = -1120.4 * v * v + 5742.3 * v - 4353.8;
+  }
+
+  if (ntu < 0) ntu = 0;
   if (ntu > 3000) ntu = 3000;
+
   ok = (vPin > 0.05);
   return ok ? ntu : NAN;
 }
@@ -192,79 +204,89 @@ float readTurbidity(bool &ok) {
 float readTDS(bool &ok, float waterTempC) {
   float vPin = readPinMilliVolts(PIN_TDS) / 1000.0;
   float v = vPin / DIVIDER_TDS;
-  // Temperature compensation to 25C (DFRobot Gravity TDS formula).
   float comp = 1.0 + 0.02 * (waterTempC - 25.0);
   float vc = v / comp;
-  float tds = (133.42 * vc*vc*vc - 255.86 * vc*vc + 857.39 * vc) * 0.5; // ppm
+  float tds = (133.42 * vc * vc * vc - 255.86 * vc * vc + 857.39 * vc) * 0.5;
+
   if (tds < 0) tds = 0;
+
   ok = (vPin > 0.02);
   return ok ? tds : NAN;
 }
 
 float readRain(bool &ok) {
   float mv = readPinMilliVolts(PIN_RAIN);
-  // Map DRY(high mv)->0% .. WET(low mv)->100%.
   float pct = (float)(RAIN_MV_DRY - mv) * 100.0 / (float)(RAIN_MV_DRY - RAIN_MV_WET);
-  if (pct < 0)   pct = 0;
+
+  if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
-  ok = true;                       // resistive rain board is always "readable"
+
+  ok = true;
   return pct;
 }
 
 // ============================================================================
-//  Status logic  (SAFE / WARNING / DANGER) -- mirrors backend statusService.js
+// 10. EVALUATION & CLASSIFICATION
 // ============================================================================
+
 const char* classify(float v, const Range& r) {
   if (isnan(v)) return "UNKNOWN";
-  if (v < r.warnLow  || v > r.warnHigh) return "DANGER";
-  if (v < r.safeLow  || v > r.safeHigh) return "WARNING";
+  if (v < r.warnLow || v > r.warnHigh) return "DANGER";
+  if (v < r.safeLow || v > r.safeHigh) return "WARNING";
   return "SAFE";
 }
 
-// Overall = the worst status among all valid sensors.
 const char* worstOf(const char* s[5]) {
-  bool danger = false, warning = false;
+  bool danger = false;
+  bool warning = false;
+
   for (int i = 0; i < 5; i++) {
-    if (strcmp(s[i], "DANGER")  == 0) danger  = true;
+    if (strcmp(s[i], "DANGER") == 0) danger = true;
     if (strcmp(s[i], "WARNING") == 0) warning = true;
   }
-  if (danger)  return "DANGER";
+
+  if (danger) return "DANGER";
   if (warning) return "WARNING";
   return "SAFE";
 }
 
-// ============================================================================
-//  Take one full reading cycle. Continues even if individual sensors fail.
-// ============================================================================
 Reading takeReading() {
   Reading r;
+
   r.temperature  = readTemperature(r.ok[0]);
   r.rain         = readRain(r.ok[3]);
-  r.temperature  = r.ok[0] ? r.temperature : NAN;
   float tForTds  = r.ok[0] ? r.temperature : 25.0;
   r.ph           = readPH(r.ok[1]);
   r.turbidity    = readTurbidity(r.ok[2]);
   r.conductivity = readTDS(r.ok[4], tForTds);
 
-  r.status[0] = r.ok[0] ? classify(r.temperature,  TH_TEMP) : "UNKNOWN";
-  r.status[1] = r.ok[1] ? classify(r.ph,           TH_PH)   : "UNKNOWN";
-  r.status[2] = r.ok[2] ? classify(r.turbidity,    TH_TURB) : "UNKNOWN";
-  r.status[3] = r.ok[3] ? classify(r.rain,         TH_RAIN) : "UNKNOWN";
-  r.status[4] = r.ok[4] ? classify(r.conductivity, TH_TDS)  : "UNKNOWN";
-  r.overall   = worstOf(r.status);
+  r.status[0] = r.ok[0] ? classify(r.temperature, TH_TEMP)  : "UNKNOWN";
+  r.status[1] = r.ok[1] ? classify(r.ph, TH_PH)             : "UNKNOWN";
+  r.status[2] = r.ok[2] ? classify(r.turbidity, TH_TURB)   : "UNKNOWN";
+  r.status[3] = r.ok[3] ? classify(r.rain, TH_RAIN)         : "UNKNOWN";
+  r.status[4] = r.ok[4] ? classify(r.conductivity, TH_TDS) : "UNKNOWN";
 
-  int csq = modem.getSignalQuality();            // 0-31, 99 = unknown
-  r.signalPct = (csq == 99 || csq < 0) ? 0 : (int)((csq / 31.0) * 100.0);
+  r.overall = worstOf(r.status);
+
+  int csq = modem.getSignalQuality();
+  if (csq == 99 || csq < 0) {
+    r.signalPct = 0;
+  } else {
+    r.signalPct = (int)((csq / 31.0) * 100.0);
+  }
+
   return r;
 }
 
 // ============================================================================
-//  Build the JSON payload (field names MUST match the backend schema)
+// 11. JSON BUILDING
 // ============================================================================
+
 String buildJson(const Reading& r) {
   StaticJsonDocument<512> doc;
+
   doc["deviceId"] = DEVICE_ID;
-  // Send null for a failed sensor rather than a bogus number.
+
   if (r.ok[0]) doc["temperature"]  = round2(r.temperature);  else doc["temperature"]  = nullptr;
   if (r.ok[1]) doc["ph"]           = round2(r.ph);           else doc["ph"]           = nullptr;
   if (r.ok[2]) doc["turbidity"]    = round2(r.turbidity);    else doc["turbidity"]    = nullptr;
@@ -286,42 +308,114 @@ String buildJson(const Reading& r) {
   return out;
 }
 
-float round2(float v){ return isnan(v) ? v : roundf(v * 100.0) / 100.0; }
+// ============================================================================
+// 12. GSM / GPRS NETWORK MANAGEMENT
+// ============================================================================
 
-// ============================================================================
-//  GSM / GPRS lifecycle
-// ============================================================================
 bool gsmConnect() {
-  SerialMon.println(F("[GSM] Initialising modem..."));
-  modem.restart();                                  // clean state each connect
+  SerialMon.println();
+  SerialMon.println("[GSM] Initialising modem...");
+
+  if (!modem.restart()) {
+    SerialMon.println("[GSM] Modem restart FAILED");
+    return false;
+  }
+
   String info = modem.getModemInfo();
-  SerialMon.print(F("[GSM] Modem: ")); SerialMon.println(info);
+  SerialMon.print("[GSM] Modem: ");
+  SerialMon.println(info);
 
-  if (strlen(SIM_PIN) && modem.getSimStatus() != 3) modem.simUnlock(SIM_PIN);
+  if (strlen(SIM_PIN) && modem.getSimStatus() != 3) {
+    modem.simUnlock(SIM_PIN);
+  }
 
-  SerialMon.print(F("[GSM] Waiting for network..."));
-  if (!modem.waitForNetwork(60000L)) { SerialMon.println(F(" FAIL")); return false; }
-  SerialMon.println(F(" OK"));
+  SerialMon.print("[GSM] Waiting for network...");
+  if (!modem.waitForNetwork(60000L)) {
+    SerialMon.println(" FAIL");
+    return false;
+  }
+  SerialMon.println(" OK");
 
-  SerialMon.print(F("[GPRS] Connecting APN: ")); SerialMon.println(APN);
-  if (!modem.gprsConnect(APN, GPRS_USER, GPRS_PASS)) { SerialMon.println(F("[GPRS] FAIL")); return false; }
-  SerialMon.print(F("[GPRS] Connected. IP: ")); SerialMon.println(modem.getLocalIP());
+  SerialMon.print("[GPRS] Connecting APN: ");
+  SerialMon.println(APN);
+
+  if (!modem.gprsConnect(APN, GPRS_USER, GPRS_PASS)) {
+    SerialMon.println("[GPRS] CONNECTION FAILED");
+    return false;
+  }
+
+  SerialMon.println("[GPRS] CONNECTED");
+  SerialMon.print("[GPRS] IP address: ");
+  SerialMon.println(modem.getLocalIP());
+
+  return modem.isGprsConnected();
+}
+
+// ============================================================================
+// 13. HTTPS CONNECTION TEST
+// ============================================================================
+
+bool testHTTPS() {
+  SerialMon.println("\n--------------------------------");
+  SerialMon.println("[HTTPS] Testing Railway connection");
+  SerialMon.println("--------------------------------");
+
+  SerialMon.print("[HTTPS] Server: ");
+  SerialMon.println(API_HOST);
+
+  gsmClient.setTimeout(30);
+
+  if (!gsmClient.connect(API_HOST, API_PORT)) {
+    SerialMon.println("[HTTPS] CONNECTION FAILED");
+    return false;
+  }
+
+  SerialMon.println("[HTTPS] CONNECTION SUCCESS");
+
+  gsmClient.println("GET / HTTP/1.1");
+  gsmClient.print("Host: ");
+  gsmClient.println(API_HOST);
+  gsmClient.println("Connection: close");
+  gsmClient.println();
+
+  unsigned long start = millis();
+  while (gsmClient.connected() && millis() - start < 10000) {
+    while (gsmClient.available()) {
+      char c = gsmClient.read();
+      SerialMon.write(c);
+      start = millis();
+    }
+  }
+
+  gsmClient.stop();
+  SerialMon.println("\n[HTTPS] Test finished");
   return true;
 }
 
-// POST the JSON payload with retries. Returns true on HTTP 2xx.
+// ============================================================================
+// 14. DATA UPLOAD VIA HTTPS POST
+// ============================================================================
+
 bool postReading(const String& json) {
   for (int attempt = 1; attempt <= MAX_HTTP_RETRIES; attempt++) {
     SerialMon.printf("[HTTP] POST attempt %d/%d\n", attempt, MAX_HTTP_RETRIES);
 
-    if (!modem.isGprsConnected()) {                 // recover a dropped link
-      SerialMon.println(F("[GPRS] Link down, reconnecting..."));
-      if (!gsmConnect()) { delay(3000); continue; }
+    if (!modem.isGprsConnected()) {
+      SerialMon.println("[GPRS] Link down, reconnecting...");
+      if (!gsmConnect()) {
+        delay(3000);
+        continue;
+      }
     }
 
+    HttpClient http(gsmClient, API_HOST, API_PORT);
     http.setTimeout(20000);
+
+    SerialMon.println("[HTTPS] Opening connection...");
+
     http.beginRequest();
     http.post(API_PATH);
+    http.sendHeader("Host", API_HOST);
     http.sendHeader("Content-Type", "application/json");
     http.sendHeader("x-api-key", API_KEY);
     http.sendHeader("Content-Length", json.length());
@@ -329,63 +423,121 @@ bool postReading(const String& json) {
     http.print(json);
     http.endRequest();
 
-    int status = http.responseStatusCode();
+    int status  = http.responseStatusCode();
     String body = http.responseBody();
-    SerialMon.printf("[HTTP] status=%d body=%s\n", status, body.c_str());
+    http.stop();
 
-    if (status >= 200 && status < 300) return true;
-    delay(2000L * attempt);                          // simple backoff
+    if (status == 301 || status == 308) {
+      SerialMon.println("[HTTP] Redirected to HTTPS - API_HOST must be a plain-HTTP relay, not Railway directly");
+    } else if (status == 401) {
+      SerialMon.println("[HTTP] Unauthorized - API_KEY does not match DEVICE_API_KEY on Railway");
+    } else if (status < 0) {
+      SerialMon.println("[HTTP] No connection/response (TLS, DNS or GPRS problem)");
+    }
+
+    SerialMon.printf("[HTTP] status=%d\n", status);
+    SerialMon.print("[HTTP] body=");
+    SerialMon.println(body);
+
+    if (status >= 200 && status < 300) {
+      return true;
+    }
+
+    delay(2000L * attempt);
   }
+
   return false;
 }
 
 // ============================================================================
-//  SMS alerts (device-side, immediate) with per-sensor anti-spam cooldown
+// 15. SMS ALERT ENGINE
 // ============================================================================
+
 void maybeSendSms(const Reading& r) {
   for (int i = 0; i < 5; i++) {
     if (strcmp(r.status[i], "DANGER") != 0) continue;
-    unsigned long now = millis();
-    if (now - lastSmsAt[i] < SMS_COOLDOWN_MS && lastSmsAt[i] != 0) continue;
 
-    float val = (i==0?r.temperature:i==1?r.ph:i==2?r.turbidity:i==3?r.rain:r.conductivity);
+    unsigned long now = millis();
+    if (lastSmsAt[i] != 0 && now - lastSmsAt[i] < SMS_COOLDOWN_MS) continue;
+
+    float val;
+    if (i == 0)      val = r.temperature;
+    else if (i == 1) val = r.ph;
+    else if (i == 2) val = r.turbidity;
+    else if (i == 3) val = r.rain;
+    else             val = r.conductivity;
+
     char msg[140];
     snprintf(msg, sizeof(msg),
-      "FishSafe %s ALERT: %s = %.1f (DANGER). Check pond now.",
-      DEVICE_ID, SENSOR_NAMES[i], val);
-    SerialMon.print(F("[SMS] ")); SerialMon.println(msg);
-    if (modem.sendSMS(ALERT_PHONE, String(msg))) lastSmsAt[i] = now;
+             "FishSafe %s ALERT: %s = %.1f (DANGER). Check pond now.",
+             DEVICE_ID, SENSOR_NAMES[i], val);
+
+    SerialMon.print("[SMS] ");
+    SerialMon.println(msg);
+
+    if (modem.sendSMS(ALERT_PHONE, String(msg))) {
+      lastSmsAt[i] = now;
+      SerialMon.println("[SMS] Sent OK");
+    } else {
+      SerialMon.println("[SMS] Send FAILED");
+    }
   }
 }
 
 // ============================================================================
-//  Arduino setup / loop
+// 16. SETUP
 // ============================================================================
+
 void setup() {
   SerialMon.begin(115200);
-  delay(200);
-  SerialMon.println(F("\n=== FishSafe firmware booting ==="));
+  delay(1000);
 
+  SerialMon.println("\n================================");
+  SerialMon.println("FishSafe Firmware Booting");
+  SerialMon.println("================================");
+
+  // ADC Configuration
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);          // full 0-3.3V range on ADC pins
-  ds18b20.begin();
+  analogSetAttenuation(ADC_11db);
 
-  // SIM800L UART. 9600 baud is the safe default for SIM800L.
+  // Initialize sensors & hardware serial
+  ds18b20.begin();
   SerialAT.begin(9600, SERIAL_8N1, PIN_SIM_RX, PIN_SIM_TX);
   delay(3000);
 
-  gsmConnect();                            // best-effort; loop() will recover
+  // Connect to GPRS
+  if (!gsmConnect()) {
+    // Don't stop here: postReading() retries the connection from loop().
+    SerialMon.println("\n[GSM] GSM/GPRS FAILED - will retry in loop");
+    return;
+  }
+
+  SerialMon.println("\n================================");
+  SerialMon.println("[GSM] GSM + GPRS READY");
+  SerialMon.println("================================");
+
+  // Test HTTPS connection
+  testHTTPS();
 }
+
+// ============================================================================
+// 17. MAIN LOOP
+// ============================================================================
 
 void loop() {
   unsigned long now = millis();
-  if (now - lastSend < SEND_INTERVAL_MS && lastSend != 0) return;
+
+  if (lastSend != 0 && now - lastSend < SEND_INTERVAL_MS) {
+    delay(100);
+    return;
+  }
+
   lastSend = now;
 
+  // Take sensor measurements
   Reading r = takeReading();
 
-  // Human-readable debug dump.
-  SerialMon.println(F("---- Reading ----"));
+  SerialMon.println("\n---- Reading ----");
   SerialMon.printf("Temp: %.2f C   [%s]\n", r.temperature,  r.status[0]);
   SerialMon.printf("pH  : %.2f     [%s]\n", r.ph,           r.status[1]);
   SerialMon.printf("Turb: %.1f NTU [%s]\n", r.turbidity,    r.status[2]);
@@ -393,11 +545,19 @@ void loop() {
   SerialMon.printf("TDS : %.0f ppm [%s]\n", r.conductivity, r.status[4]);
   SerialMon.printf("Overall: %s | Signal: %d%%\n", r.overall, r.signalPct);
 
+  // Build JSON payload
   String json = buildJson(r);
-  SerialMon.print(F("[JSON] ")); SerialMon.println(json);
+  SerialMon.print("[JSON] ");
+  SerialMon.println(json);
 
+  // Upload to Railway Backend
   bool sent = postReading(json);
-  SerialMon.println(sent ? F("[HTTP] Upload OK") : F("[HTTP] Upload FAILED"));
+  if (sent) {
+    SerialMon.println("[HTTP] Upload OK");
+  } else {
+    SerialMon.println("[HTTP] Upload FAILED");
+  }
 
-  maybeSendSms(r);                          // immediate danger SMS
+  // Check and dispatch SMS alerts if needed
+  maybeSendSms(r);
 }

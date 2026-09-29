@@ -1,0 +1,507 @@
+/*
+ * ============================================================================
+ * FishSafe - ESP32 + SIM800L -> ThingSpeak ThingHTTP -> Railway
+ * Sensor Telemetry & SMS Alert Firmware (v2)
+ * ============================================================================
+ *
+ * Flow:
+ *   ESP32 --(plain HTTP GET, port 80)--> api.thingspeak.com/apps/thinghttp/send_request
+ *   ThingHTTP --(HTTPS POST, TLS 1.2)--> Railway /api/sensors/data
+ *
+ * The live JSON is URL-encoded and sent as the "payload" query parameter.
+ *
+ * REQUIRED ThingHTTP settings (ThingSpeak -> Apps -> ThingHTTP -> Edit):
+ *   Body    : %%payload%%
+ *   Headers : Content-Type = application/json
+ *             x-api-key    = <your Railway DEVICE_API_KEY>
+ *
+ * v2 change: ThingSpeak always returns 200 when it forwards the request,
+ * so success is now judged by Railway's reply body as well.
+ */
+
+#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_RX_BUFFER 1024
+
+#define SerialMon Serial
+#define SerialAT  Serial2
+
+#include <TinyGsmClient.h>
+#include <ArduinoHttpClient.h>
+#include <ArduinoJson.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ============================================================================
+// 1. MODEM & CLIENT
+// ============================================================================
+
+TinyGsm       modem(SerialAT);
+TinyGsmClient gsmClient(modem);   // plain TCP - ThingSpeak accepts HTTP on port 80
+
+// ============================================================================
+// 2. THINGSPEAK THINGHTTP CONFIGURATION
+// ============================================================================
+
+const char* TS_HOST       = "api.thingspeak.com";
+const int   TS_PORT       = 80;
+const char* TS_PATH       = "/apps/thinghttp/send_request";
+const char* THINGHTTP_KEY = "40LNBJIOQYOALDHS";   // ThingHTTP app API key (regenerate later)
+
+const char* DEVICE_ID = "FISHSAFE-001";
+
+// ============================================================================
+// 3. GSM / GPRS / SMS CONFIGURATION
+// ============================================================================
+
+const char* APN       = "dialogbb";
+const char* GPRS_USER = "";
+const char* GPRS_PASS = "";
+const char* SIM_PIN   = "";
+
+const char* ALERT_PHONE = "+94769767326";
+
+// ============================================================================
+// 4. TIMING & RETRIES
+// ============================================================================
+
+const unsigned long SEND_INTERVAL_MS = 60UL * 1000UL;        // every 60 s
+const unsigned long SMS_COOLDOWN_MS  = 15UL * 60UL * 1000UL; // 15 min per sensor
+const int           MAX_HTTP_RETRIES = 3;
+
+// ============================================================================
+// 5. PIN DEFINITIONS
+// ============================================================================
+
+#define PIN_DS18B20 4
+#define PIN_PH      34
+#define PIN_TURB    35
+#define PIN_TDS     32
+#define PIN_RAIN    33
+
+// ESP32 TX2 (GPIO17) -> SIM800L RX
+// ESP32 RX2 (GPIO16) <- SIM800L TX
+#define PIN_SIM_TX  17
+#define PIN_SIM_RX  16
+
+// ============================================================================
+// 6. SENSOR OBJECTS & VARIABLES
+// ============================================================================
+
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature ds18b20(&oneWire);
+
+unsigned long lastSend = 0;
+unsigned long lastSmsAt[5] = {0, 0, 0, 0, 0};
+
+const char* SENSOR_NAMES[5] = {
+  "temperature", "ph", "turbidity", "rain", "conductivity"
+};
+
+// Calibration constants
+const int   ADC_SAMPLES  = 20;
+float       PH_V7        = 1.65;
+float       PH_V4        = 2.02;
+float       TURB_V_CLEAR = 4.10;
+int         RAIN_MV_DRY  = 3100;
+int         RAIN_MV_WET  = 700;
+
+const float DIVIDER_PH   = 0.667;
+const float DIVIDER_TURB = 0.667;
+const float DIVIDER_TDS  = 1.000;
+
+// ============================================================================
+// 7. THRESHOLDS & STRUCTURES
+// ============================================================================
+
+struct Range {
+  float warnLow;
+  float safeLow;
+  float safeHigh;
+  float warnHigh;
+};
+
+Range TH_TEMP = {23.0, 25.0, 32.0, 34.0};
+Range TH_PH   = {6.0,  6.5,  8.5,  9.0};
+Range TH_TURB = {-1e9, -1e9, 25.0, 40.0};
+Range TH_RAIN = {-1e9, -1e9, 50.0, 80.0};
+Range TH_TDS  = {50.0, 100.0, 800.0, 1000.0};
+
+struct Reading {
+  float temperature;
+  float ph;
+  float turbidity;
+  float rain;
+  float conductivity;
+
+  bool        ok[5];
+  const char* status[5];
+  const char* overall;
+  int         signalPct;
+};
+
+// ============================================================================
+// 8. HELPERS
+// ============================================================================
+
+float round2(float v) {
+  if (isnan(v)) return v;
+  return roundf(v * 100.0) / 100.0;
+}
+
+float readPinMilliVolts(int pin) {
+  long sum = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    sum += analogReadMilliVolts(pin);
+    delay(2);
+  }
+  return (float)sum / ADC_SAMPLES;
+}
+
+// Percent-encode everything except RFC 3986 unreserved characters
+String urlEncode(const String& s) {
+  const char* hex = "0123456789ABCDEF";
+  String out;
+  out.reserve(s.length() * 3);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      out += '%';
+      out += hex[((unsigned char)c >> 4) & 0x0F];
+      out += hex[(unsigned char)c & 0x0F];
+    }
+  }
+  return out;
+}
+
+// ============================================================================
+// 9. SENSOR READINGS
+// ============================================================================
+
+float readTemperature(bool &ok) {
+  ds18b20.requestTemperatures();
+  float t = ds18b20.getTempCByIndex(0);
+  ok = (t != DEVICE_DISCONNECTED_C && t > -40 && t < 85);
+  return ok ? t : NAN;
+}
+
+float readPH(bool &ok) {
+  float vPin  = readPinMilliVolts(PIN_PH) / 1000.0;
+  float slope = (4.0 - 7.0) / (PH_V4 - PH_V7);
+  float ph    = 7.0 + (vPin - PH_V7) * slope;
+  ok = (vPin > 0.05 && ph > 0.0 && ph < 14.0);
+  return ok ? ph : NAN;
+}
+
+float readTurbidity(bool &ok) {
+  float vPin = readPinMilliVolts(PIN_TURB) / 1000.0;
+  float v    = vPin / DIVIDER_TURB;
+  float ntu;
+
+  if (v >= TURB_V_CLEAR) ntu = 0.0;
+  else                   ntu = -1120.4 * v * v + 5742.3 * v - 4353.8;
+
+  if (ntu < 0)    ntu = 0;
+  if (ntu > 3000) ntu = 3000;
+
+  ok = (vPin > 0.05);
+  return ok ? ntu : NAN;
+}
+
+float readTDS(bool &ok, float waterTempC) {
+  float vPin = readPinMilliVolts(PIN_TDS) / 1000.0;
+  float v    = vPin / DIVIDER_TDS;
+  float comp = 1.0 + 0.02 * (waterTempC - 25.0);
+  float vc   = v / comp;
+  float tds  = (133.42 * vc * vc * vc - 255.86 * vc * vc + 857.39 * vc) * 0.5;
+
+  if (tds < 0) tds = 0;
+
+  ok = (vPin > 0.02);
+  return ok ? tds : NAN;
+}
+
+float readRain(bool &ok) {
+  float mv  = readPinMilliVolts(PIN_RAIN);
+  float pct = (float)(RAIN_MV_DRY - mv) * 100.0 / (float)(RAIN_MV_DRY - RAIN_MV_WET);
+
+  if (pct < 0)   pct = 0;
+  if (pct > 100) pct = 100;
+
+  ok = true;
+  return pct;
+}
+
+// ============================================================================
+// 10. CLASSIFICATION
+// ============================================================================
+
+const char* classify(float v, const Range& r) {
+  if (isnan(v)) return "UNKNOWN";
+  if (v < r.warnLow || v > r.warnHigh) return "DANGER";
+  if (v < r.safeLow || v > r.safeHigh) return "WARNING";
+  return "SAFE";
+}
+
+const char* worstOf(const char* s[5]) {
+  bool danger = false, warning = false;
+  for (int i = 0; i < 5; i++) {
+    if (strcmp(s[i], "DANGER") == 0)  danger = true;
+    if (strcmp(s[i], "WARNING") == 0) warning = true;
+  }
+  if (danger)  return "DANGER";
+  if (warning) return "WARNING";
+  return "SAFE";
+}
+
+Reading takeReading() {
+  Reading r;
+
+  r.temperature  = readTemperature(r.ok[0]);
+  r.rain         = readRain(r.ok[3]);
+  float tForTds  = r.ok[0] ? r.temperature : 25.0;
+  r.ph           = readPH(r.ok[1]);
+  r.turbidity    = readTurbidity(r.ok[2]);
+  r.conductivity = readTDS(r.ok[4], tForTds);
+
+  r.status[0] = r.ok[0] ? classify(r.temperature,  TH_TEMP) : "UNKNOWN";
+  r.status[1] = r.ok[1] ? classify(r.ph,           TH_PH)   : "UNKNOWN";
+  r.status[2] = r.ok[2] ? classify(r.turbidity,    TH_TURB) : "UNKNOWN";
+  r.status[3] = r.ok[3] ? classify(r.rain,         TH_RAIN) : "UNKNOWN";
+  r.status[4] = r.ok[4] ? classify(r.conductivity, TH_TDS)  : "UNKNOWN";
+
+  r.overall = worstOf(r.status);
+
+  int csq = modem.getSignalQuality();
+  r.signalPct = (csq == 99 || csq < 0) ? 0 : (int)((csq / 31.0) * 100.0);
+
+  return r;
+}
+
+// ============================================================================
+// 11. JSON BUILDING (same format Railway already expects)
+// ============================================================================
+
+String buildJson(const Reading& r) {
+  StaticJsonDocument<512> doc;
+
+  doc["deviceId"] = DEVICE_ID;
+
+  if (r.ok[0]) doc["temperature"]  = round2(r.temperature);  else doc["temperature"]  = nullptr;
+  if (r.ok[1]) doc["ph"]           = round2(r.ph);           else doc["ph"]           = nullptr;
+  if (r.ok[2]) doc["turbidity"]    = round2(r.turbidity);    else doc["turbidity"]    = nullptr;
+  if (r.ok[3]) doc["rain"]         = round2(r.rain);         else doc["rain"]         = nullptr;
+  if (r.ok[4]) doc["conductivity"] = round2(r.conductivity); else doc["conductivity"] = nullptr;
+
+  JsonObject st = doc.createNestedObject("statuses");
+  st["temperature"]  = r.status[0];
+  st["ph"]           = r.status[1];
+  st["turbidity"]    = r.status[2];
+  st["rain"]         = r.status[3];
+  st["conductivity"] = r.status[4];
+
+  doc["overallStatus"] = r.overall;
+  doc["signal"]        = r.signalPct;
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+// ============================================================================
+// 12. GSM / GPRS
+// ============================================================================
+
+bool gsmConnect() {
+  SerialMon.println("\n[GSM] Initialising modem...");
+
+  if (!modem.restart()) {
+    SerialMon.println("[GSM] Modem restart FAILED");
+    return false;
+  }
+
+  SerialMon.print("[GSM] Modem: ");
+  SerialMon.println(modem.getModemInfo());
+
+  if (strlen(SIM_PIN) && modem.getSimStatus() != 3) {
+    modem.simUnlock(SIM_PIN);
+  }
+
+  SerialMon.print("[GSM] Waiting for network...");
+  if (!modem.waitForNetwork(60000L)) {
+    SerialMon.println(" FAIL");
+    return false;
+  }
+  SerialMon.println(" OK");
+
+  SerialMon.print("[GPRS] Connecting APN: ");
+  SerialMon.println(APN);
+
+  if (!modem.gprsConnect(APN, GPRS_USER, GPRS_PASS)) {
+    SerialMon.println("[GPRS] CONNECTION FAILED");
+    return false;
+  }
+
+  SerialMon.print("[GPRS] CONNECTED, IP: ");
+  SerialMon.println(modem.getLocalIP());
+
+  return modem.isGprsConnected();
+}
+
+// ============================================================================
+// 13. SEND VIA THINGSPEAK THINGHTTP
+// ============================================================================
+
+bool sendViaThingHttp(const String& json) {
+  String path = String(TS_PATH) +
+                "?api_key=" + THINGHTTP_KEY +
+                "&payload=" + urlEncode(json);
+
+  for (int attempt = 1; attempt <= MAX_HTTP_RETRIES; attempt++) {
+    SerialMon.printf("[HTTP] ThingHTTP attempt %d/%d\n", attempt, MAX_HTTP_RETRIES);
+
+    if (!modem.isGprsConnected()) {
+      SerialMon.println("[GPRS] Link down, reconnecting...");
+      if (!gsmConnect()) {
+        delay(3000);
+        continue;
+      }
+    }
+
+    HttpClient http(gsmClient, TS_HOST, TS_PORT);
+    http.setTimeout(20000);
+    http.connectionKeepAlive();
+
+    int err = http.get(path);
+    if (err != 0) {
+      SerialMon.printf("[HTTP] Connect/request error %d\n", err);
+      http.stop();
+      delay(2000L * attempt);
+      continue;
+    }
+
+    int    status = http.responseStatusCode();
+    String body   = http.responseBody();   // ThingHTTP returns Railway's response body
+    http.stop();
+
+    SerialMon.printf("[HTTP] status=%d\n", status);
+    SerialMon.print("[HTTP] body=");
+    SerialMon.println(body);
+
+    // Success only if ThingSpeak said 2xx AND Railway's reply has no "error"
+    if (status >= 200 && status < 300 && body.indexOf("\"error\"") < 0) {
+      return true;
+    }
+
+    // Railway rejected the API key - retrying won't fix it, so stop now
+    if (body.indexOf("API key") >= 0) {
+      SerialMon.println("[HTTP] Railway rejected the key - add x-api-key header in ThingHTTP");
+      return false;
+    }
+
+    // ThingSpeak itself rejected the request
+    if (status == 400 || status == 401 || status == 404) {
+      SerialMon.println("[HTTP] Check THINGHTTP_KEY and the ThingHTTP app settings");
+    }
+
+    delay(2000L * attempt);
+  }
+
+  return false;
+}
+
+// ============================================================================
+// 14. SMS ALERT ENGINE
+// ============================================================================
+
+void maybeSendSms(const Reading& r) {
+  for (int i = 0; i < 5; i++) {
+    if (strcmp(r.status[i], "DANGER") != 0) continue;
+
+    unsigned long now = millis();
+    if (lastSmsAt[i] != 0 && now - lastSmsAt[i] < SMS_COOLDOWN_MS) continue;
+
+    float val;
+    if      (i == 0) val = r.temperature;
+    else if (i == 1) val = r.ph;
+    else if (i == 2) val = r.turbidity;
+    else if (i == 3) val = r.rain;
+    else             val = r.conductivity;
+
+    char msg[140];
+    snprintf(msg, sizeof(msg),
+             "FishSafe %s ALERT: %s = %.1f (DANGER). Check pond now.",
+             DEVICE_ID, SENSOR_NAMES[i], val);
+
+    SerialMon.print("[SMS] ");
+    SerialMon.println(msg);
+
+    if (modem.sendSMS(ALERT_PHONE, String(msg))) {
+      lastSmsAt[i] = now;
+      SerialMon.println("[SMS] Sent OK");
+    } else {
+      SerialMon.println("[SMS] Send FAILED");
+    }
+  }
+}
+
+// ============================================================================
+// 15. SETUP
+// ============================================================================
+
+void setup() {
+  SerialMon.begin(115200);
+  delay(1000);
+
+  SerialMon.println("\n================================");
+  SerialMon.println("FishSafe Firmware Booting (ThingHTTP v2)");
+  SerialMon.println("================================");
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  ds18b20.begin();
+  SerialAT.begin(9600, SERIAL_8N1, PIN_SIM_RX, PIN_SIM_TX);
+  delay(3000);
+
+  if (!gsmConnect()) {
+    SerialMon.println("[GSM] GSM/GPRS FAILED - will retry in loop");
+    return;
+  }
+
+  SerialMon.println("[GSM] GSM + GPRS READY");
+}
+
+// ============================================================================
+// 16. MAIN LOOP
+// ============================================================================
+
+void loop() {
+  unsigned long now = millis();
+
+  if (lastSend != 0 && now - lastSend < SEND_INTERVAL_MS) {
+    delay(100);
+    return;
+  }
+  lastSend = now;
+
+  Reading r = takeReading();
+
+  SerialMon.println("\n---- Reading ----");
+  SerialMon.printf("Temp: %.2f C   [%s]\n", r.temperature,  r.status[0]);
+  SerialMon.printf("pH  : %.2f     [%s]\n", r.ph,           r.status[1]);
+  SerialMon.printf("Turb: %.1f NTU [%s]\n", r.turbidity,    r.status[2]);
+  SerialMon.printf("Rain: %.0f %%  [%s]\n", r.rain,         r.status[3]);
+  SerialMon.printf("TDS : %.0f ppm [%s]\n", r.conductivity, r.status[4]);
+  SerialMon.printf("Overall: %s | Signal: %d%%\n", r.overall, r.signalPct);
+
+  String json = buildJson(r);
+  SerialMon.print("[JSON] ");
+  SerialMon.println(json);
+
+  if (sendViaThingHttp(json)) SerialMon.println("[HTTP] Upload OK");
+  else                        SerialMon.println("[HTTP] Upload FAILED");
+
+  maybeSendSms(r);
+}
